@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install dev tools on Debian 13 (trixie):
 # Docker, VS Code, nvm + Node LTS, Python, PHP, MySQL (MariaDB), PostgreSQL, DBeaver, Android Studio, Flutter,
-# Git, NetBird, Flameshot (Lightshot replacement), ngrok, Postman, Chrome, NVIDIA driver (RTX 3050 hybrid)
+# Git, NetBird, Flameshot (Lightshot replacement), ngrok, Postman, Chrome, Ollama,
+# NVIDIA driver (RTX 3050 hybrid)
 # Safe to run repeatedly: components that are already installed are skipped.
 set -euo pipefail
 
@@ -24,7 +25,7 @@ GIT_NAME="${GIT_NAME:-}"
 GIT_EMAIL="${GIT_EMAIL:-}"
 # Optional: ngrok authtoken from https://dashboard.ngrok.com/get-started/your-authtoken
 NGROK_AUTHTOKEN="${NGROK_AUTHTOKEN:-}"
-# 1 = also create and start the minio/singlestore/redis containers, 0 = only pull the images
+# 1 = also create and start the minio/redis containers, 0 = only pull the images
 START_DEV_CONTAINERS="${START_DEV_CONTAINERS:-1}"
 # Redis: leave the password empty for no auth (dev default)
 REDIS_IMAGE="${REDIS_IMAGE:-redis:7-alpine}"
@@ -35,12 +36,11 @@ MINIO_ROOT_USER="${MINIO_ROOT_USER:-minioadmin}"
 MINIO_ROOT_PASSWORD="${MINIO_ROOT_PASSWORD:-minioadmin}"
 MINIO_API_PORT="${MINIO_API_PORT:-9000}"
 MINIO_CONSOLE_PORT="${MINIO_CONSOLE_PORT:-9001}"
-# SingleStore: free dev license key from https://portal.singlestore.com (without it the container exits)
-SINGLESTORE_LICENSE="${SINGLESTORE_LICENSE:-}"
-SINGLESTORE_ROOT_PASSWORD="${SINGLESTORE_ROOT_PASSWORD:-singlestore}"
-# 3307 on the host, because MariaDB already occupies 3306
-SINGLESTORE_PORT="${SINGLESTORE_PORT:-3307}"
-SINGLESTORE_STUDIO_PORT="${SINGLESTORE_STUDIO_PORT:-8080}"
+# Ollama models land in /usr/share/ollama (on /) by default, which fills up a small
+# root partition fast. Keep them on /home instead. It must NOT be inside
+# /home/$USER: that is mode 0700, and the service runs as the 'ollama' user,
+# which then cannot traverse into it.
+OLLAMA_MODELS_DIR="${OLLAMA_MODELS_DIR:-/home/ollama-models}"
 # -----------------------------------------------------------------------
 
 if [ "$(id -u)" -eq 0 ]; then
@@ -79,7 +79,8 @@ NEED_REBOOT=0
 log "Base packages"
 sudo apt-get update
 BASE=()
-for p in ca-certificates curl wget gnupg tar pciutils; do is_installed "$p" || BASE+=("$p"); done
+# zstd is needed by the Ollama installer (it ships .tar.zst and aborts without it)
+for p in ca-certificates curl wget gnupg tar pciutils zstd; do is_installed "$p" || BASE+=("$p"); done
 if [ "${#BASE[@]}" -gt 0 ]; then sudo apt-get install -y "${BASE[@]}"; else skip "base packages"; fi
 sudo install -m 0755 -d /etc/apt/keyrings
 
@@ -299,10 +300,10 @@ if getent group docker >/dev/null; then
 fi
 
 # ============================ Docker images ============================
-log "Docker images (minio, singlestore, redis)"
+log "Docker images (minio, redis)"
 # Only if docker already works without sudo (the docker group takes effect after re-login)
 if has_cmd docker && docker info >/dev/null 2>&1; then
-  for img in cgr.dev/chainguard/minio ghcr.io/singlestore-labs/singlestoredb-dev "$REDIS_IMAGE"; do
+  for img in cgr.dev/chainguard/minio "$REDIS_IMAGE"; do
     if docker image inspect "$img" >/dev/null 2>&1; then
       skip "image $img"
     else
@@ -348,21 +349,6 @@ else
       cgr.dev/chainguard/minio server /data --console-address ":9001"
   else
     warn "port $MINIO_API_PORT is already in use, minio skipped (set MINIO_API_PORT=<other port>)"
-  fi
-
-  # ---- SingleStore ----
-  # The dev image refuses to start without a license key, so do not even try.
-  if [ -z "$SINGLESTORE_LICENSE" ]; then
-    skip "SINGLESTORE_LICENSE is empty, singlestore skipped (key: https://portal.singlestore.com)"
-  elif docker container inspect singlestore >/dev/null 2>&1 || ! port_taken "$SINGLESTORE_PORT"; then
-    ensure_container singlestore \
-      -p "$SINGLESTORE_PORT:3306" -p "$SINGLESTORE_STUDIO_PORT:8080" \
-      -e "ROOT_PASSWORD=$SINGLESTORE_ROOT_PASSWORD" \
-      -e "SINGLESTORE_LICENSE=$SINGLESTORE_LICENSE" \
-      -v singlestore-data:/data \
-      ghcr.io/singlestore-labs/singlestoredb-dev
-  else
-    warn "port $SINGLESTORE_PORT is already in use, singlestore skipped (set SINGLESTORE_PORT=<other port>)"
   fi
 
   # ---- Redis ----
@@ -636,6 +622,54 @@ PROFILE
   ok "Go PATH added to ~/.profile"
 fi
 
+# ============================ Ollama ============================
+log "Ollama"
+if has_cmd ollama; then
+  skip "Ollama $(ollama --version 2>/dev/null | grep -oP 'version is \K.*' || true)"
+else
+  # The official installer puts the binary in /usr/local/bin, creates the 'ollama'
+  # system user and installs ollama.service. With an NVIDIA driver already present
+  # it detects nvidia-smi and exits without touching the CUDA driver.
+  curl -fsSL https://ollama.com/install.sh | sh && ok "Ollama installed" || warn "failed to install Ollama"
+fi
+
+# The installer enables the service itself, so honour AUTOSTART_SERVICES here too
+if systemctl list-unit-files ollama.service --no-legend 2>/dev/null | grep -q .; then
+  if [ "$AUTOSTART_SERVICES" -eq 1 ]; then
+    if systemctl is-enabled --quiet ollama && systemctl is-active --quiet ollama; then
+      skip "ollama already active"
+    else
+      sudo systemctl enable --now ollama; ok "ollama enabled"
+    fi
+  else
+    if systemctl is-enabled --quiet ollama; then
+      sudo systemctl disable ollama >/dev/null 2>&1; ok "ollama no longer starts on boot"
+    else
+      skip "ollama already disabled on boot"
+    fi
+  fi
+fi
+
+# Point the model store at $OLLAMA_MODELS_DIR via a drop-in, so an Ollama
+# upgrade (which rewrites ollama.service) does not lose the setting.
+if getent passwd ollama >/dev/null \
+   && systemctl list-unit-files ollama.service --no-legend 2>/dev/null | grep -q .; then
+  OLLAMA_OVERRIDE=/etc/systemd/system/ollama.service.d/override.conf
+  if grep -qs "OLLAMA_MODELS=$OLLAMA_MODELS_DIR" "$OLLAMA_OVERRIDE"; then
+    skip "ollama models dir ($OLLAMA_MODELS_DIR)"
+  else
+    sudo install -o ollama -g ollama -m 0755 -d "$OLLAMA_MODELS_DIR"
+    sudo install -m 0755 -d /etc/systemd/system/ollama.service.d
+    sudo tee "$OLLAMA_OVERRIDE" >/dev/null <<CONF
+[Service]
+Environment="OLLAMA_MODELS=$OLLAMA_MODELS_DIR"
+CONF
+    sudo systemctl daemon-reload
+    if systemctl is-active --quiet ollama; then sudo systemctl restart ollama; fi
+    ok "ollama models dir -> $OLLAMA_MODELS_DIR"
+  fi
+fi
+
 # ============================ Summary ============================
 set +e
 echo
@@ -658,12 +692,13 @@ is_installed dbeaver-ce && dpkg -s dbeaver-ce | grep '^Version' | sed 's/^/dbeav
 has_cmd netbird   && echo "NetBird $(netbird version 2>/dev/null)"
 has_cmd ngrok     && ngrok version
 has_cmd flameshot && flameshot --version 2>/dev/null | head -1
+has_cmd ollama    && ollama --version 2>/dev/null | head -1
 [ -f "$POSTMAN_DIR/app/resources/app/package.json" ] && \
   echo "Postman $(grep -oP '"version":\s*"\K[^"]+' "$POSTMAN_DIR/app/resources/app/package.json" | head -1)"
 is_installed nvidia-driver && dpkg -s nvidia-driver | grep '^Version' | sed 's/^/nvidia-driver /'
 has_cmd nvidia-smi && nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null
 if has_cmd docker && docker info >/dev/null 2>&1; then
-  CONTAINERS="$(docker ps -a --filter name=minio --filter name=singlestore --filter name=redis \
+  CONTAINERS="$(docker ps -a --filter name=minio --filter name=redis \
     --format '  {{.Names}}: {{.Status}} ({{.Ports}})' 2>/dev/null)"
   [ -n "$CONTAINERS" ] && { echo "Docker containers:"; echo "$CONTAINERS"; }
 fi
@@ -687,7 +722,7 @@ echo "     to the command: flameshot gui"
 echo "  7. Use the RTX 3050: prime-run <application>, or right-click an app in the KDE menu"
 echo "     > 'Run using dedicated graphics card'"
 echo "  8. MinIO console: http://localhost:$MINIO_CONSOLE_PORT ($MINIO_ROOT_USER / $MINIO_ROOT_PASSWORD)"
-echo "  9. SingleStore: needs a free license key from https://portal.singlestore.com, then run:"
-echo "     SINGLESTORE_LICENSE=<key> ./install-dev-tools.sh"
-echo "     Studio: http://localhost:$SINGLESTORE_STUDIO_PORT | mysql -h127.0.0.1 -P$SINGLESTORE_PORT -uroot -p"
-echo " 10. Redis: redis-cli -h 127.0.0.1 -p $REDIS_PORT   (or: docker exec -it redis redis-cli)"
+echo "  9. Redis: redis-cli -h 127.0.0.1 -p $REDIS_PORT   (or: docker exec -it redis redis-cli)"
+echo " 10. Ollama models are stored in $OLLAMA_MODELS_DIR (not on /)."
+echo "     It ships without models. Pull one first, e.g.: ollama pull llama3.2"
+echo "     then: ollama run llama3.2   | API: http://localhost:11434"
